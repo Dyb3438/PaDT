@@ -88,12 +88,12 @@ def parseVRTintoCompletion(processor, completion_ids, hidden_states, need_thinki
         within_object_name_tag = False
         object_idx = -1
         current_label = ""
-
+        
         try:
             while vob_idx < len(completion_per_vob):
-                if processor.tokenizer.eos_token in completion_per_vob[vob_idx]:
+                if '<|endoftext|>' in completion_per_vob[vob_idx]:
                     break
-                if within_answer_tag is False and '<' in completion_per_vob[vob_idx] and '</' not in completion_per_vob[vob_idx] and 'answer' in completion_per_vob[vob_idx + 1] and '>' in completion_per_vob[vob_idx + 2]:
+                if within_answer_tag is False and '<' in completion_per_vob[vob_idx] and vob_idx < len(completion_per_vob) - 2 and '</' not in completion_per_vob[vob_idx] and 'answer' in completion_per_vob[vob_idx + 1] and '>' in completion_per_vob[vob_idx + 2]:
                     within_answer_tag = True
                     vob_idx += 3
                     continue

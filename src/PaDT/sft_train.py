@@ -37,6 +37,7 @@ def main(script_args, training_args, model_args):
             data = [json.loads(i) for i in open(data_file, 'r').readlines()]
 
         for item in data:
+            item['id'] = str(item['id'])
             if 'image' in item:
                 if isinstance(item['image'], str):
                     # Store image path instead of loading the image
@@ -49,33 +50,37 @@ def main(script_args, training_args, model_args):
                 else:
                     raise ValueError(f"Unsupported image type: {type(item['image'])}")
             
-            item['problem'] = item['conversations'][0]['value'].replace('<image>', '')
-            item['solution'] = {
-                'text': item['answer_template'],
-                'objects': item['objects']
-            }
-            del item['answer_template'], item['objects']
-            del item['conversations']
-            all_data.append(item)
+            new_conversations = []
+            for idx, conv in enumerate(item['conversations']):
+                if idx == 0 and conv['from'] not in ['human', 'user']:
+                    # skip the system instruction
+                    continue
+                new_conversations.append({
+                    'role': 'user' if conv['from'] in ['human', 'user'] else 'assistant',
+                    'content': [
+                        *({'type': 'image', 'text': None} for _ in range(len(item['image_path'])) if len(new_conversations) == 0),
+                        {'type': 'text', 'text': conv['value'].replace('<image>', '')}
+                    ]
+                })
 
+            if 'answer_template' in item and item['answer_template'] is not None and new_conversations[-1]['role'] != 'assistant':
+                new_conversations.append({
+                    'role': 'assistant',
+                    'content': [
+                        {'type': 'text', 'text': item['answer_template']}
+                    ]
+                })
+            item['conversations'] = new_conversations
+            del item['answer_template']
+            # id, task, conversation, objects, image_path
+            all_data.append(item)
+            
     dataset = Dataset.from_list(all_data)
     
     def make_conversation(example):
         assert all(os.path.exists(p) for p in example['image_path']), f"Image paths do not exist: {example['image_path']}"
         # Don't load image here, just store the path
-
-        return {
-            'image_path': [p for p in example['image_path']],  # Store path instead of loaded image
-            'problem': example['problem'],
-            'solution': example['solution'],
-            'prompt': [{
-                'role': 'user',
-                'content': [
-                    *({'type': 'image', 'text': None} for _ in range(len(example['image_path']))),
-                    {'type': 'text', 'text': example['problem']}
-                ]
-            }]
-        }
+        return example
 
     # Map the conversations
     dataset = dataset.map(make_conversation, num_proc=16)

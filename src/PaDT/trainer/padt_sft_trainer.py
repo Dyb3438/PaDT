@@ -15,6 +15,7 @@ import re
 import os
 import cv2
 import json
+import copy
 import torch
 import PIL.Image
 import numpy as np
@@ -65,7 +66,6 @@ class RepeatRandomSampler(Sampler):
     def __init__(
         self,
         data_source: Sized,
-        mini_repeat_count: int,
         batch_size: int = 1,
         repeat_count: int = 1,
         seed: Optional[int] = None,
@@ -73,7 +73,6 @@ class RepeatRandomSampler(Sampler):
         gradient_accumulation_steps: int = 1
     ):
         self.data_source = data_source
-        self.mini_repeat_count = mini_repeat_count
         self.batch_size = batch_size
         self.repeat_count = repeat_count
         self.num_samples = len(data_source)
@@ -83,20 +82,54 @@ class RepeatRandomSampler(Sampler):
         self.generator = torch.Generator()
         if seed is not None:
             self.generator.manual_seed(seed)
+            np.random.seed(seed)
+        self.__split_data_source_into_whether_has_vrt()
+    
+    def __split_data_source_into_whether_has_vrt(self):
+        self.data_indices_with_vrt = []
+        self.data_indices_without_vrt = []
+        for idx, data in enumerate(self.data_source):
+            if 'objects' in data and len(data['objects']) > 0:
+                self.data_indices_with_vrt.append(idx)
+            else:
+                self.data_indices_without_vrt.append(idx)
+        self.vrt_ratio = len(self.data_indices_with_vrt) / len(self.data_source)
+        print('VRT on dataset ratio:', self.vrt_ratio)
+        return
 
     def __iter__(self):
-        indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
-        indexes = [indexes[i : i + self.batch_size] for i in range(0, len(indexes) // self.batch_size * self.batch_size, self.batch_size)]
-        for chunk in indexes:
+        np.random.shuffle(self.data_indices_with_vrt)
+        np.random.shuffle(self.data_indices_without_vrt)
+
+        # one gradient batch: self.batch_size = bs_per_device * num_processes * gradient_accumulation_steps
+        # Now, I need to ensure each device has VRT or all devices have no VRT
+        VRT_pointer = 0
+        NO_VRT_pointer = 0
+        
+        for curr_pointer in range(0, len(self), self.batch_size):
+            this_batch_end_pointer = curr_pointer + self.batch_size
+            should_vrt = int(this_batch_end_pointer * self.vrt_ratio)
+
+            current_batch_indices = []
+            if should_vrt - VRT_pointer >= (self.num_processes * self.gradient_accumulation_steps):
+                while VRT_pointer < should_vrt:
+                    current_batch_indices.append(self.data_indices_with_vrt[VRT_pointer % len(self.data_indices_with_vrt)])
+                    VRT_pointer += 1
+            while VRT_pointer + NO_VRT_pointer < this_batch_end_pointer:
+                current_batch_indices.append(self.data_indices_without_vrt[NO_VRT_pointer % len(self.data_indices_without_vrt)])
+                NO_VRT_pointer += 1
+            
             for _ in range(self.repeat_count):
                 for accumultaion_step_idx in range(self.gradient_accumulation_steps):
-                    accumulation_chunk = chunk[accumultaion_step_idx::self.gradient_accumulation_steps]
-                    chunk_idx = torch.arange(0, len(accumulation_chunk), dtype=torch.long)[:, None].repeat_interleave(self.mini_repeat_count, -1).view(-1)
-                    for index in chunk_idx:
-                        yield accumulation_chunk[index]
+                    accumulation_chunk = current_batch_indices[accumultaion_step_idx::self.gradient_accumulation_steps]
+                    for i in range(self.num_processes):
+                        this_device_chunk = accumulation_chunk[i::self.num_processes]
+                        np.random.shuffle(this_device_chunk)
+                        for idx in this_device_chunk:
+                            yield idx
 
     def __len__(self) -> int:
-        return self.num_samples * self.mini_repeat_count * self.repeat_count
+        return self.num_samples * self.repeat_count
 
 
 class PaDTSFTTrainer(Trainer):
@@ -313,7 +346,7 @@ class PaDTSFTTrainer(Trainer):
         numerator = 2 * (inputs * targets * loss_mask).sum(dim=-1)
         denominator = (inputs * loss_mask).sum(dim=-1) + (targets * loss_mask).sum(dim=-1)
         loss = 1 - (numerator + 1) / (denominator + 1)
-        return loss.sum() / ((loss_mask.sum(dim=-1) > 0) + 1e-5).sum()
+        return loss.sum() / ((loss_mask.sum(dim=-1) > 0).sum() + 1e-5)
     
     def sigmoid_focal_loss(self, inputs, targets, loss_mask, alpha = 0.25, gamma = 2):
         # inputs: preds [N, H, W]
@@ -325,17 +358,23 @@ class PaDTSFTTrainer(Trainer):
         loss = ce_loss * ((1 - p_t) ** gamma)
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
-        return ((loss * loss_mask).sum(dim=[1, 2]) / (loss_mask.sum(dim=[1, 2]) + 1e-5)).sum() / ((loss_mask.sum(dim=[1, 2]) > 0) + 1e-5).sum()
+        return ((loss * loss_mask).sum(dim=[1, 2]) / (loss_mask.sum(dim=[1, 2]) + 1e-5)).sum() / ((loss_mask.sum(dim=[1, 2]) > 0).sum() + 1e-5)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The PaDTTrainer does not support returning outputs")
 
-        prompt_text = [self.processing_class.apply_chat_template(i['prompt'], tokenize=False, add_generation_prompt=True) for i in inputs]
-        
         images = []
-        completions = []
+        completion_ids = []
+        completion_masks = []
+        multimodal_inputs = {
+            'image_grid_thw': [],
+            'pixel_values': []
+        }
+        completion_max_len = 0
+
         solutions = []
+
         for idx, x in enumerate(inputs):
             # input_images
             assert len(x['image_path']) == 1, "current support only an image per sample"
@@ -360,123 +399,160 @@ class PaDTSFTTrainer(Trainer):
             im_w, im_h = image.size
             patch_w, patch_h = round(im_w / 28), round(im_h / 28)
 
-            solution = x['solution']
-            completion = solution['text']
             pattern = r'(<\|Obj_(\d+)\|>)'
-            obj_in_completion = re.findall(pattern, completion)
-            obj_strs = [i[0] for i in obj_in_completion]
-            objs = [solution['objects'][int(i[1])] for i in obj_in_completion]
             pattern_without_matching = r'<\|Obj_\d+\|>'
-            completion_parts = re.split(pattern_without_matching, completion)
+
+            completion_id = []
+            completion_mask = []
+            new_objects = []
             
-            completion_with_vrt = completion_parts[0]
-            new_objs = []
-            for obj_str, completion_part, obj in zip(obj_strs, completion_parts[1:], objs):
-                obj_ = obj.copy()
-                selected_patches = np.array(obj_['patches'])
-                if self.args.random_select_patch_num < 0:
-                    pick_patch = selected_patches.copy()
-                elif self.args.random_select_patch is False:
-                    selected_patches_x, selected_patches_y = selected_patches % patch_w, selected_patches // patch_w
-                    
-                    left_patches_m = selected_patches_x == selected_patches_x.min()
-                    right_patches_m = selected_patches_x == selected_patches_x.max()
-                    top_patches_m = selected_patches_y == selected_patches_y.min()
-                    bottom_patches_m = selected_patches_y == selected_patches_y.max()
-                    centre_patches_m = (left_patches_m + right_patches_m + top_patches_m + bottom_patches_m) == 0                        
-                    
-                    left_patches, right_patches, top_patches, bottom_patches, centre_patches = \
-                        selected_patches[left_patches_m], \
-                        selected_patches[right_patches_m], \
-                        selected_patches[top_patches_m], \
-                        selected_patches[bottom_patches_m], \
-                        selected_patches[centre_patches_m]
-                    if centre_patches_m.sum() == 0:
-                        centre_patches = selected_patches
+            conversations = copy.deepcopy(x['conversations'])
+            for conv_idx, conv in enumerate(conversations):
+                # replace <|Obj_xx|> with <|VRT_xxx|>
+                for cont_idx, cont in enumerate(conv['content']):
+                    if cont['type'] != 'text':
+                        continue
+                    obj_in_cont = re.findall(pattern, cont['text'])
+                    obj_strs = [i[0] for i in obj_in_cont]
+                    objs = [x['objects'][int(i[1])] for i in obj_in_cont]
+                    cont_parts = re.split(pattern_without_matching, cont['text'])
+
+                    cont_with_vrt = cont_parts[0]
+                    for obj_str, cont_part, obj in zip(obj_strs, cont_parts[1:], objs):
+                        obj_ = obj.copy()
+                        selected_patches = np.array(obj_['patches'])
+
+                        selecting_stategy = 'random' if self.args.random_select_patch else 'border'
+                        if 'selecting_stategy' in obj_ and obj_['selecting_stategy'] is not None:
+                            selecting_stategy = obj_['selecting_stategy']
+                            assert selecting_stategy in ['random', 'border'], 'The selecting stategy `' + obj_['selecting_stategy'] + '` is not implemented.'
+
+                        if selecting_stategy == 'border':
+                            selected_patches_x, selected_patches_y = selected_patches % patch_w, selected_patches // patch_w
+                            left_patches_m = selected_patches_x == selected_patches_x.min()
+                            right_patches_m = selected_patches_x == selected_patches_x.max()
+                            top_patches_m = selected_patches_y == selected_patches_y.min()
+                            bottom_patches_m = selected_patches_y == selected_patches_y.max()
+                            centre_patches_m = (left_patches_m + right_patches_m + top_patches_m + bottom_patches_m) == 0                        
+                            left_patches, right_patches, top_patches, bottom_patches, centre_patches = \
+                                selected_patches[left_patches_m], \
+                                selected_patches[right_patches_m], \
+                                selected_patches[top_patches_m], \
+                                selected_patches[bottom_patches_m], \
+                                selected_patches[centre_patches_m]
+                            if centre_patches_m.sum() == 0:
+                                centre_patches = selected_patches
+                            pick_patch = np.array([np.random.choice(centre_patches), np.random.choice(left_patches), np.random.choice(top_patches), np.random.choice(right_patches), np.random.choice(bottom_patches)])
+                        else:
+                            if self.args.random_select_patch_num < 0:
+                                pick_patch = selected_patches.copy()
+                            else:
+                                if selected_patches.shape[0] < self.args.random_select_patch_num:
+                                    pick_patch = np.random.choice(selected_patches, self.args.random_select_patch_num, replace=True)
+                                else:
+                                    pick_patch = np.random.choice(selected_patches, self.args.random_select_patch_num, replace=False)
                         
-                    pick_patch = np.array([np.random.choice(centre_patches), np.random.choice(left_patches), np.random.choice(top_patches), np.random.choice(right_patches), np.random.choice(bottom_patches)])
+                        obj_['picked'] = pick_patch
+                        obj_['use_losses'] = (conv['role'] == 'assistant')
+                        new_objects.append(obj_)
+                        cont_with_vrt += self.processing_class.pid2vrt(pick_patch) + cont_part
+
+                    cont['text'] = cont_with_vrt
+
+                if conv_idx == 0:
+                    conv_str = self.processing_class.apply_chat_template([conv], tokenize=False, add_generation_prompt=False)
+                    conv_ids = self.processing_class(
+                        text=conv_str,
+                        images=[image],
+                        return_tensors='pt',
+                        padding=False,
+                        add_special_tokens=False
+                    ).to(self.accelerator.device)
+                    multimodal_inputs['image_grid_thw'].append(conv_ids['image_grid_thw'])
+                    multimodal_inputs['pixel_values'].append(conv_ids['pixel_values'])
                 else:
-                    if selected_patches.shape[0] < self.args.random_select_patch_num:
-                        pick_patch = np.random.choice(selected_patches, self.args.random_select_patch_num, replace=True)
-                    else:
-                        pick_patch = np.random.choice(selected_patches, self.args.random_select_patch_num, replace=False)
+                    conv_str = '<|im_start|>assistant\n%s<|im_end|>\n' % ''.join([i['text'] for i in conv['content']])
+                    conv_ids = self.processing_class(
+                        text=conv_str,
+                        return_tensors='pt',
+                        padding=False,
+                        add_special_tokens=False
+                    ).to(self.accelerator.device)
+
+                completion_id.append(conv_ids['input_ids'])
+                conv_mask = torch.zeros_like(conv_ids['input_ids'], dtype=torch.bool)
+                if conv['role'] == 'assistant':
+                    conv_mask[:, 3:-1] = True
+                completion_mask.append(conv_mask)
             
-                obj_['picked'] = pick_patch
-                new_objs.append(obj_)
-                completion_with_vrt += self.processing_class.pid2vrt(pick_patch) + completion_part
+            completion_id = torch.concat(completion_id, dim=-1)  # [1, L]
+            completion_mask = torch.concat(completion_mask, dim=-1)  # [1, L]
+            solutions.append(new_objects)
+            completion_ids.append(completion_id)
+            completion_masks.append(completion_mask)
+            completion_max_len = max(completion_max_len, int(completion_id.shape[-1]))
 
-            solutions.append({
-                'text': solution['text'],
-                'objects': new_objs
-            })
-            completions.append(completion_with_vrt + self.processing_class.tokenizer.eos_token)
+        new_completion_ids = completion_ids[0].new_full((len(completion_ids), completion_max_len), self.processing_class.pad_token_id, dtype=completion_ids[0].dtype)
+        new_completion_masks = completion_masks[0].new_full((len(completion_masks), completion_max_len), 0, dtype=torch.int64)
+        new_attention_masks = torch.zeros_like(new_completion_masks)
 
-        # tokenizing
-        prompt_inputs = self.processing_class(
-            text=prompt_text,
-            images=images,
-            return_tensors='pt',
-            padding=True,
-            padding_side='left',
-            add_special_tokens=False
-        )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-        batch_size = prompt_ids.size(0)
-        prompt_length = prompt_ids.size(1)
-        multimodal_inputs = {
-            'image_grid_thw': prompt_inputs['image_grid_thw'],
-            'pixel_values': prompt_inputs['pixel_values']
-        }
+        for comp_idx, (completion_id, completion_mask) in enumerate(zip(completion_ids, completion_masks)):
+            new_completion_ids[comp_idx:comp_idx+1, :completion_id.shape[-1]] = completion_id
+            new_completion_masks[comp_idx:comp_idx+1, :completion_mask.shape[-1]] = completion_mask
+            new_attention_masks[comp_idx:comp_idx+1, :completion_mask.shape[-1]] = 1
         
-        completion_inputs = self.processing_class(
-            text=completions,
-            return_tensors='pt',
-            padding=True,
-            padding_side='right',
-            add_special_tokens=False
-        )
-        completion_inputs = super()._prepare_inputs(completion_inputs)
-        completion_ids, completion_mask = completion_inputs["input_ids"], completion_inputs["attention_mask"]
+        new_completion_masks = new_completion_masks[:, 1:] # skip the first token, apply on the assistant response.
+        multimodal_inputs['image_grid_thw'] = torch.concat(multimodal_inputs['image_grid_thw'], dim=0)
+        multimodal_inputs['pixel_values'] = torch.concat(multimodal_inputs['pixel_values'], dim=0)
 
         # prepare for Robust Per-token Cross-Entropy Loss.
+        object_use_losses = []
         loss_masks = []
         gt_bboxes = []
         vision_patch_nums = torch.nn.functional.pad((multimodal_inputs['image_grid_thw'].cumprod(-1)[:, -1] // (self.model.config.vision_config.spatial_merge_size ** 2)).cumsum(-1), (1, 0), 'constant', 0)
         all_vision_patch_nums = vision_patch_nums[-1]
         for sol, vpn in zip(solutions, vision_patch_nums[:-1]):
-            for obj in sol['objects']:
+            for obj in sol:
                 this_object_loss_mask = torch.zeros((obj['picked'].shape[0], all_vision_patch_nums), device=self.accelerator.device, dtype=torch.bool)
                 this_object_loss_mask[:, vpn.item() + np.array(obj['patches'])] = True
                 this_object_loss_mask[np.arange(obj['picked'].shape[0]), vpn.item() + obj['picked']] = False
                 loss_masks.append(this_object_loss_mask)
                 # obj['bbox']: x1, y1, x2, y2. Value in [0, 1].
                 gt_bboxes.append(obj['bbox'])
-
-        loss_masks = torch.cat(loss_masks, dim=0)
+                object_use_losses.append(obj['use_losses'])
+        
+        if len(loss_masks) == 0:
+            loss_masks = torch.zeros(0, all_vision_patch_nums, dtype=torch.bool).to(self.accelerator.device)
+        else:
+            loss_masks = torch.cat(loss_masks, dim=0)
         loss_masks = torch.nn.functional.pad(loss_masks, (self.model_embed_token_size, 0), 'constant', False)
         gt_bboxes = torch.Tensor(gt_bboxes).to(self.accelerator.device).to(torch.bfloat16)
         if len(gt_bboxes.shape) == 1:
             gt_bboxes = gt_bboxes.unsqueeze(dim=-1).repeat_interleave(4, dim=-1)
+        object_use_losses = torch.Tensor(object_use_losses).to(self.accelerator.device).to(torch.bfloat16)
 
         # Concatenate for full sequence
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        # input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        # attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+        input_ids = new_completion_ids
+        attention_mask = new_attention_masks
+        batch_size = input_ids.shape[0]
 
-        input_ids = self.processing_class.assign_to_global_vrt_id(input_ids, multimodal_inputs['image_grid_thw'])
+        model_input_ids = self.processing_class.assign_to_global_vrt_id(input_ids.clone(), multimodal_inputs['image_grid_thw'])
 
         # Get the current policy's log probabilities
-        model_output = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, **multimodal_inputs)
+        model_output = model(input_ids=model_input_ids, attention_mask=attention_mask, output_hidden_states=True, **multimodal_inputs)
 
-        logits = model_output.logits[:, prompt_length-1:-1, :]  # (B, L, V)
-        input_ids = input_ids[:, prompt_length:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        logits = model_output.logits[:, :-1] # (B, L, V)
+        target_ids = model_input_ids[:, 1:]
         if self.args.use_sft_vp_mask:
-            visual_patch_mask = input_ids >= self.model_embed_token_size
+            visual_patch_mask = target_ids >= self.model_embed_token_size
             logits[visual_patch_mask] = logits[visual_patch_mask].masked_fill(loss_masks, float('-inf'))
         
         # decode to bbox
-        hidden_states = torch.stack(model_output.hidden_states, dim=1)[:, -1:, prompt_length-1:-1].permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() # [BS, Layers, N, Dim] -> [N, Layers, BS, 1, D]
-        completions, feats, labels, vps, vps_feats = parseVRTintoCompletion(self.processing_class, completion_ids, hidden_states, torch.tensor([False] * batch_size), model_output.past_image_embeds, multimodal_inputs['image_grid_thw']) # hidden_states: [N, Layers, BS, D]
+        hidden_states = torch.stack(model_output.hidden_states, dim=1).permute(2, 1, 0, 3).unsqueeze(dim=-2).contiguous() # [BS, Layers, N, Dim] -> [N, Layers, BS, 1, D]
+        completions, feats, labels, vps, vps_feats = parseVRTintoCompletion(self.processing_class, input_ids[:, 1:], hidden_states, torch.tensor([False] * batch_size), model_output.past_image_embeds, multimodal_inputs['image_grid_thw']) # hidden_states: [N, Layers, BS, D]
+
         low_res_image_embeds = model_output.past_image_embeds
         high_res_image_embeds = model_output.past_high_res_image_embeds
         visual_pe = model_output.past_visual_pe
@@ -493,7 +569,7 @@ class PaDTSFTTrainer(Trainer):
 
             obj_idx = 0
             for sol in solutions:
-                for obj in sol['objects']:
+                for obj in sol:
                     if 'rle' in obj:
                         gt_m = mask.decode(obj['rle'])
                         mask_h, mask_w = decoded_list['pred_mask_valid_hw'][0][obj_idx].item(), decoded_list['pred_mask_valid_hw'][1][obj_idx].item()
@@ -501,6 +577,8 @@ class PaDTSFTTrainer(Trainer):
                         gt_mask[obj_idx, :mask_h * 4, :mask_w * 4] = resized_gt_m
                         loss_mask[obj_idx, :mask_h * 4, :mask_w * 4] = 1.0
                     obj_idx += 1
+
+            loss_mask[object_use_losses == 0, ...] = 0.
             mask_loss = self.dice_loss(decoded_list['pred_mask'], gt_mask, loss_mask) + self.sigmoid_focal_loss(decoded_list['pred_mask'], gt_mask, loss_mask)
             self._metrics['mask_loss'].append(self.accelerator.gather_for_metrics(mask_loss).mean().item())
         else:
@@ -508,9 +586,9 @@ class PaDTSFTTrainer(Trainer):
 
         # token loss
         logit_log_probs = logits.log_softmax(dim=-1)
-        token_log_prob = torch.gather(logit_log_probs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+        token_log_prob = torch.gather(logit_log_probs, dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
         per_token_loss = -token_log_prob
-        sft_loss = ((per_token_loss * completion_mask).sum(dim=-1) / (completion_mask.sum(dim=-1) + 1e-4)).to(logits.dtype)
+        sft_loss = ((per_token_loss * new_completion_masks).sum(dim=-1) / (new_completion_masks.sum(dim=-1) + 1e-4)).to(logits.dtype)
         self._metrics['sft_loss'].append(self.accelerator.gather_for_metrics(sft_loss).mean().item())
         
         if self.args.use_bbox_loss:
@@ -520,8 +598,9 @@ class PaDTSFTTrainer(Trainer):
             num_bboxes = gt_bboxes.shape[0]
             giou, iou = self.generalized_box_iou(self.box_cxcywh_to_xyxy(pred_bboxes), gt_bboxes)
             giou = torch.diag(giou).to(pred_bboxes.dtype)
-            bbox_loss = 1. - giou.sum() / (num_bboxes + 1e-4)
-            bbox_loss += torch.nn.functional.l1_loss(pred_bboxes, self.box_xyxy_to_cxcywh(gt_bboxes), reduction='none').sum() / (num_bboxes + 1e-4)
+
+            bbox_loss = 1. - (giou * object_use_losses).sum() / (object_use_losses.sum() + 1e-4)
+            bbox_loss += (torch.nn.functional.l1_loss(pred_bboxes, self.box_xyxy_to_cxcywh(gt_bboxes), reduction='none') * object_use_losses[:, None]).sum() / (object_use_losses.sum() + 1e-4)
             self._metrics['bbox_loss'].append(self.accelerator.gather_for_metrics(bbox_loss).mean().item())
             self._metrics['iou'].append(self.accelerator.gather_for_metrics(torch.diag(iou).sum() / (num_bboxes + 1e-4)).mean().item())
             self._metrics['giou'].append(self.accelerator.gather_for_metrics(giou.sum() / (num_bboxes + 1e-4)).mean().item())
@@ -558,7 +637,6 @@ class PaDTSFTTrainer(Trainer):
         
         return RepeatRandomSampler(
             data_source=self.train_dataset,
-            mini_repeat_count=1,
             batch_size=effective_batch_size,
             repeat_count=1,
             seed=self.args.seed,
@@ -570,7 +648,6 @@ class PaDTSFTTrainer(Trainer):
         """Returns a sampler for evaluation."""
         return RepeatRandomSampler(
             data_source=eval_dataset,
-            mini_repeat_count=1,
             seed=self.args.seed,
             num_processes=self.accelerator.num_processes,
             gradient_accumulation_steps=self.args.gradient_accumulation_steps
