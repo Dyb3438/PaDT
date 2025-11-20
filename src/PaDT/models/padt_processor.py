@@ -24,7 +24,7 @@ class VisonTextProcessingClass(object):
         # add visual patch tokenization into processing_class
         max_visual_patch_num = image_grid_thw.cumprod(-1).max(dim=0)[0][-1] // (self.spatial_merge_size) ** 2
         if len(self.processing_class.tokenizer.get_vocab()) - self.model_embed_token_size < max_visual_patch_num:
-            self.processing_class.tokenizer.add_tokens([AddedToken("<|VRT_%d|>" % i, lstrip=False, rstrip=False, special=False, normalized=False) for i in range(len(self.processing_class.tokenizer.get_vocab()) - self.model_embed_token_size, max_visual_patch_num)])
+            self.processing_class.tokenizer.add_tokens([AddedToken("<|VRT_%d|>" % i, lstrip=False, rstrip=False, special=True, normalized=False, single_word=True) for i in range(len(self.processing_class.tokenizer.get_vocab()) - self.model_embed_token_size, max_visual_patch_num)])
         return True
 
     def __call__(self, *args, **kwargs):
