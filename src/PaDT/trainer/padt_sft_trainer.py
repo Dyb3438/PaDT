@@ -578,7 +578,7 @@ class PaDTSFTTrainer(Trainer):
             obj_idx = 0
             for sol in solutions:
                 for obj in sol:
-                    if 'rle' in obj:
+                    if 'rle' in obj and obj['rle'] is not None:
                         gt_m = mask.decode(obj['rle'])
                         mask_h, mask_w = decoded_list['pred_mask_valid_hw'][0][obj_idx].item(), decoded_list['pred_mask_valid_hw'][1][obj_idx].item()
                         resized_gt_m = torch.from_numpy(cv2.resize(gt_m.astype(np.float32()), (mask_w * 4, mask_h * 4)) > 0.5).to(gt_mask.dtype).to(gt_mask.device)
