@@ -6,7 +6,7 @@ echo "REPO_HOME: $REPO_HOME"
 data_paths="${REPO_HOME}/dataset/llava_mix665k/processed/llava_v1_5_mix665k.json:PaDT-MLLM/ReferringImageCaptioning/ric_instances_train2017.json:PaDT-MLLM/COCO/instances_train2017.json:PaDT-MLLM/RefCOCO/refcoco_train.json:PaDT-MLLM/RefCOCO/refcoco+_train.json:PaDT-MLLM/RefCOCO/refcocog_train.json"
 image_folders="${REPO_HOME}/dataset/llava_mix665k:${REPO_HOME}/dataset/coco/train2017:${REPO_HOME}/dataset/coco/train2017:${REPO_HOME}/dataset/coco/train2014:${REPO_HOME}/dataset/coco/train2014:${REPO_HOME}/dataset/coco/train2014"
 
-model_path="PaDT-MLLM/PaDT-Pro-3B"
+model_path="PaDT-MLLM/PaDT_Pro_3B"
 echo "data_paths: $data_paths"
 echo "image_folders: $image_folders"
 

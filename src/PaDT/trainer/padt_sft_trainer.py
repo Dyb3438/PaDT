@@ -461,6 +461,14 @@ class PaDTSFTTrainer(Trainer):
 
                 if conv_idx == 0:
                     conv_str = self.processing_class.apply_chat_template([conv], tokenize=False, add_generation_prompt=False)
+                    # preprocess one pass to construct the VRT into tokenizer.
+                    conv_ids = self.processing_class(
+                        text=conv_str,
+                        images=[image],
+                        return_tensors='pt',
+                        padding=False,
+                        add_special_tokens=False
+                    )
                     conv_ids = self.processing_class(
                         text=conv_str,
                         images=[image],
