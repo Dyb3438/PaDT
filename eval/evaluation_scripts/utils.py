@@ -16,6 +16,7 @@ from accelerate import Accelerator, DeepSpeedPlugin
 from transformers.integrations.deepspeed import HfTrainerDeepSpeedConfig
 from PaDT import PaDTForConditionalGeneration, VisonTextProcessingClass, parseVRTintoCompletion
 
+import time
 
 def prepare_deepspeed(model: "Module", accelerator: "Accelerator"):
     """Prepares the model for DeepSpeed inference or evaluation by initializing it with the appropriate configuration.
@@ -193,7 +194,9 @@ def infer_dataset(
         
         with torch.no_grad():
             with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
-                if idx < len(dataset):
+                if idx < 120:
+                    start_time = time.time()
+
                     input_ = dataset[idx: idx+batch_size]
 
                     prompts_text = processor.apply_chat_template(input_['prompt'], tokenize=False, add_generation_prompt=True)
@@ -213,7 +216,9 @@ def infer_dataset(
                                 else:
                                     new_h = 28
                                     new_w = int(w * (28/h))
-                            img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
+                            else:
+                                new_w, new_h = w, h
+                            img = img.resize((new_w * 2, new_h * 2), PIL.Image.Resampling.LANCZOS)
                         except:
                             pass
                         images.append(img)
@@ -234,6 +239,8 @@ def infer_dataset(
                         **prompt_inputs, 
                         use_cache=True, max_new_tokens=1024, do_sample=False, output_hidden_states=True, return_dict_in_generate=True, synced_gpus=False
                     )
+                    end_time = time.time()
+
                     prompt_length = prompt_ids.size(1)
                     prompt_completion_ids = processor.assign_to_local_vrt_id(generate_returned_result['sequences'], prompt_inputs['image_grid_thw'])
                     completion_ids = prompt_completion_ids[:, prompt_length:]
@@ -244,11 +251,14 @@ def infer_dataset(
                     visual_pe = generate_returned_result.past_visual_pe
                     
                     decoded_list = unwrapped_model.vl_decode(feats, low_res_image_embeds, high_res_image_embeds, prompt_inputs['image_grid_thw'], visual_pe)
+                    number_tokens = completion_ids.shape[-1]
+                else:
+                    exit()
         
         if idx < len(dataset):
             with open(os.path.join(output_dir, f'{datasetname}_{accelerator.process_index}_pred_comp_{suffix}.json'), 'a+') as f:
                 for idx, completion in enumerate(completions):
-                    f.write(json.dumps({'image_id': input_['id'][idx], 'completion': completion.replace('<|endoftext|>', '').replace('<|im_end|>', '')}) + '\n')
+                    f.write(json.dumps({'image_id': input_['id'][idx], 'completion': completion.replace('<|endoftext|>', '').replace('<|im_end|>', ''), 'inference_time': end_time - start_time, 'tokens': number_tokens}) + '\n')
 
             if decoded_list['pred_boxes'].shape[0] == 0:
                 continue

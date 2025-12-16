@@ -9,11 +9,12 @@ import cv2
 import numpy as np
 import re
 import json
-
+import time
 
 if __name__ == "__main__":
 
-    MODEL_PATH="PaDT-MLLM/PaDT_Pro_3B"
+    # MODEL_PATH="PaDT-MLLM/PaDT_Pro_3B"
+    MODEL_PATH="/home/yongyi/data/PaDT_dev/checkpoints/ours/sft/PaDT-General-3B/checkpoint-18000"
     TEST_IMG_PATH="./imgs/000000368335.jpg"
 
 
@@ -34,14 +35,17 @@ if __name__ == "__main__":
     # prompt = """Please carefully check the image and detect the following objects: ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"]."""
 
     # Referring Expression Comprehension Prompt
-    # prompt = """Please carefully check the image and detect the object this sentence describes: "A red car"."""
+    prompt = """Please carefully check the image and detect the object this sentence describes: "A red car"."""
     # prompt = """Please carefully check the image and detect the object this sentence describes: "A black car"."""
     # prompt = """Please carefully check the image and detect the object this sentence describes: "A white car"."""
     # prompt = """Please carefully check the image and detect the object this sentence describes: "The horse between two cars"."""
-    prompt = """Please carefully check the image and detect the object this sentence describes: "The car is on the left side of the horse"."""
+    # prompt = """Please carefully check the image and detect the object this sentence describes: "The car is on the left side of the horse"."""
 
     # Referring Image Captioning Prompt
     # prompt = "Please describe this image."
+
+    # VQA
+    # prompt = "Is there any horse in this image?"
 
     message = [
         {
@@ -52,7 +56,10 @@ if __name__ == "__main__":
                     "image": TEST_IMG_PATH
                 }, {
                     "type": "text",
-                    "text": prompt
+                    # "text": prompt
+                    # "text": "Is there any horse in this image?"
+                    # "text": "Please describe the region: <|VRT_157|><|VRT_172|><|VRT_187|><|VRT_142|><|VRT_232|>."
+                    "text": "Please provide the bounding box coordinate of the region this sentence describes: A red car."
                 }
             ]
         }
@@ -79,6 +86,15 @@ if __name__ == "__main__":
         padding_side="left",
         return_tensors="pt",
         add_special_tokens=False
+    )
+
+    prompt_inputs = processor(
+        text=[text],
+        images=new_image_inputs,
+        padding=True,
+        padding_side="left",
+        return_tensors="pt",
+        add_special_tokens=False
     ).to("cuda:0")
 
     with torch.inference_mode():
@@ -93,7 +109,7 @@ if __name__ == "__main__":
         completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # extract Visual Reference Tokens within the sequence and their corresponding hidden features
-        completions, feats, labels, vrts, vrts_feats = parseVRTintoCompletion(processor, completion_ids, generate_returned_result['hidden_states'], torch.Tensor([False]))
+        completions, feats, labels, vrts, vrts_feats = parseVRTintoCompletion(processor, completion_ids, generate_returned_result['hidden_states'], torch.Tensor([False]), generate_returned_result.past_image_embeds, prompt_inputs['image_grid_thw'])
 
         with open('./outputs/demo/completion.txt', 'w') as f:
             f.write('Prompt: ' + text + '\n')
@@ -103,7 +119,7 @@ if __name__ == "__main__":
         high_res_image_embeds = generate_returned_result.past_high_res_image_embeds
         visual_pe = generate_returned_result.past_visual_pe
         # decode the visual task output
-        decoded_list = model.vl_decode(feats, low_res_image_embeds, high_res_image_embeds, prompt_inputs['image_grid_thw'], visual_pe)
+        decoded_list = model.vl_decode(vrts_feats, low_res_image_embeds, high_res_image_embeds, prompt_inputs['image_grid_thw'], visual_pe)
         pred_boxes = decoded_list['pred_boxes']
         pred_scores = decoded_list['pred_score'].sigmoid()
         pred_labels = sum(labels, [])

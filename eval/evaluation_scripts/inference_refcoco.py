@@ -105,7 +105,7 @@ if __name__ == "__main__":
         processor=processor,
         accelerator=accelerator,
         output_dir=output_dir,
-        batch_size=32,
+        batch_size=1,
         datasetname=split,
         suffix=suffix
     )

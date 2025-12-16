@@ -566,8 +566,8 @@ class PaDTSFTTrainer(Trainer):
         visual_pe = model_output.past_visual_pe
         
         # warm up stage: using visual prototype rather than hidden features to feed into decoder.
-        if self.state.epoch < (self.state.num_train_epochs / 4) and self.state.global_step < 300 and self.args.use_warm_up:
-            feats = vps_feats
+        # if self.state.epoch < (self.state.num_train_epochs / 4) and self.state.global_step < 300 and self.args.use_warm_up:
+        feats = vps_feats
         decoded_list = model(feats, low_res_image_embeds, high_res_image_embeds, multimodal_inputs['image_grid_thw'], visual_pe, is_main=False)
         del model_output
 

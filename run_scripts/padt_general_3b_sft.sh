@@ -29,11 +29,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node="8" \
     --model_name_or_path $model_path \
     --data_file_paths $data_paths \
     --image_folders $image_folders \
-    --per_device_train_batch_size 16 \
-    --gradient_accumulation_steps 1 \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 2 \
     --gradient_checkpointing true \
     --logging_steps 1 \
-    --num_train_epochs 2 \
+    --num_train_epochs 4 \
     --bf16 \
     --attn_implementation flash_attention_2 \
     --run_name ${EXP_NAME} \
